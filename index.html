@@ -623,7 +623,8 @@ async function saveUsers(u){
 async function saveUser(username, data){
   try{
     await db.collection('users').doc(username).set(data);
-  }catch(e){ console.error(e); }
+    return true;
+  }catch(e){ console.error(e); return false; }
 }
 async function deleteUser(name){
   try{ await db.collection('users').doc(name).delete(); }catch(e){ console.error(e); }
@@ -686,7 +687,7 @@ async function getGroup(id){
   }catch(e){ console.error(e); return null; }
 }
 async function updateGroup(id, fields){
-  try{ await db.collection('groups').doc(id).update(fields); }catch(e){ console.error(e); }
+  try{ await db.collection('groups').doc(id).update(fields); return true; }catch(e){ console.error(e); return false; }
 }
 async function getGroupMessages(id){
   try{
@@ -697,7 +698,8 @@ async function getGroupMessages(id){
 async function pushGroupMessage(id, msg){
   try{
     await db.collection('groupChats').doc(id).set({ messages: firebase.firestore.FieldValue.arrayUnion(msg) }, {merge:true});
-  }catch(e){ console.error(e); }
+    return true;
+  }catch(e){ console.error(e); return false; }
 }
 async function leaveGroup(groupId, username){
   const g = await getGroup(groupId);
@@ -774,12 +776,28 @@ async function getMessages(a,b){
     return doc.exists ? (doc.data().messages || []) : [];
   }catch(e){ console.error(e); return []; }
 }
+// Her iki kullanıcının kendi dokümanına karşılıklı olarak "kiminle sohbeti var" bilgisini
+// yazar. Bu sayede sohbet listesini açarken TÜM 'chats' koleksiyonunu (yani sistemdeki
+// herkesin tüm fotoğraf/video içeren mesajlarını) indirmek zorunda kalmayız — sadece
+// kendi konuştuğumuz kişilerin sohbetlerini tek tek (id ile) çekeriz. Bu, telefonlarda
+// yaşanan yavaşlama/donma sorununun ana kaynağıydı.
+async function addChatPartners(a,b){
+  try{
+    await Promise.all([
+      db.collection('users').doc(a).set({ chatPartners: firebase.firestore.FieldValue.arrayUnion(b) }, {merge:true}),
+      db.collection('users').doc(b).set({ chatPartners: firebase.firestore.FieldValue.arrayUnion(a) }, {merge:true})
+    ]);
+  }catch(e){ console.error(e); }
+}
 async function pushMessage(a,b,msg){
+  let ok = true;
   try{
     const ref = db.collection('chats').doc(chatKey(a,b));
     await ref.set({ messages: firebase.firestore.FieldValue.arrayUnion(msg) }, { merge:true });
-  }catch(e){ console.error(e); }
-  return await getMessages(a,b);
+  }catch(e){ console.error(e); ok = false; }
+  addChatPartners(a,b); // beklemeden (arka planda) çalışsın, sohbeti yavaşlatmasın
+  const msgs = await getMessages(a,b);
+  return { msgs, ok };
 }
 async function markMessagesRead(me, other){
   const msgs = await getMessages(me, other);
@@ -792,12 +810,15 @@ async function markMessagesRead(me, other){
 }
 async function getRecentChats(username){
   try{
-    const snap = await db.collection('chats').get();
     const chats = [];
-    snap.forEach(doc=>{
-      const parts = doc.id.split('::');
-      if(parts.length !== 2 || !parts.includes(username)) return;
-      const other = parts[0] === username ? parts[1] : parts[0];
+    const meDocEarly = await db.collection('users').doc(username).get();
+    const partners = (meDocEarly.exists && meDocEarly.data().chatPartners) || [];
+    // Sistemdeki herkesin sohbetlerini değil, sadece bizim konuştuğumuz kişilerin
+    // sohbet dokümanlarını (id ile doğrudan) çekiyoruz -> çok daha hızlı ve hafif.
+    const dmDocs = await Promise.all(partners.map(other=> db.collection('chats').doc(chatKey(username, other)).get()));
+    dmDocs.forEach((doc, i)=>{
+      if(!doc.exists) return;
+      const other = partners[i];
       const data = doc.data();
       const msgs = (data.messages || []).filter(m=> !(m.deletedFor && m.deletedFor.includes(username)));
       if(msgs.length === 0) return;
@@ -817,9 +838,8 @@ async function getRecentChats(username){
       const unread = visible.some(m => m.from !== username && !(m.readBy||[]).includes(username));
       chats.push({ other: g.name, group: g, last, unread, type:'group' });
     }
-    const meDoc = await db.collection('users').doc(username).get();
-    const leftGroups = (meDoc.exists && meDoc.data().leftGroups) || [];
-    const leftAtMap = (meDoc.exists && meDoc.data().leftAt) || {};
+    const leftGroups = (meDocEarly.exists && meDocEarly.data().leftGroups) || [];
+    const leftAtMap = (meDocEarly.exists && meDocEarly.data().leftAt) || {};
     for(const gid of leftGroups){
       if(memberIds.has(gid)) continue;
       const g = await getGroup(gid);
@@ -1612,13 +1632,31 @@ function renderSettingsTab(content, users){
   document.getElementById('change-avatar').onclick = ()=> document.getElementById('avatar-file').click();
   document.getElementById('avatar-file').onchange = async (e)=>{
     const file = e.target.files[0];
+    e.target.value = '';
     if(!file) return;
-    if(file.size > 1_500_000){ toast('Fotoğraf çok büyük (max ~1.5MB)'); return; }
-    const dataUrl = await fileToDataURL(file);
+    if(!file.type || !file.type.startsWith('image/')){ toast('Lütfen bir fotoğraf seçin'); return; }
+    // Ham dosya çok büyük olsa bile (telefon kamerası fotoğrafları normalde 2-12MB'dir)
+    // burada engellemiyoruz; aşağıda otomatik olarak küçültüp sıkıştırıyoruz.
+    toast('Fotoğraf işleniyor...');
+    let dataUrl;
+    try{
+      dataUrl = await compressImageUnder(file, 350_000, 640, 0.82);
+    }catch(err){
+      console.error(err);
+      toast('Fotoğraf okunamadı, lütfen başka bir fotoğraf deneyin');
+      return;
+    }
     const usersNow = await getUsers();
+    if(!usersNow[state.currentUser]){ toast('Bir hata oluştu, tekrar deneyin'); return; }
+    const prevAvatar = usersNow[state.currentUser].avatar;
     usersNow[state.currentUser].avatar = dataUrl;
-    await saveUser(state.currentUser, usersNow[state.currentUser]);
-    toast('Profil fotoğrafı güncellendi');
+    const ok = await saveUser(state.currentUser, usersNow[state.currentUser]);
+    if(ok){
+      toast('Profil fotoğrafı güncellendi');
+    } else {
+      usersNow[state.currentUser].avatar = prevAvatar;
+      toast('Fotoğraf kaydedilemedi, internetini kontrol edip tekrar dene');
+    }
     render();
   };
   document.getElementById('save-bio').onclick = async ()=>{
@@ -1654,6 +1692,49 @@ function fileToDataURL(file){
   });
 }
 
+// Telefon kameralarından gelen fotoğraflar genelde 2-12MB civarındadır; bunları
+// olduğu gibi Firestore'a yazmaya çalışmak hem "dosya çok büyük" hatasına hem de
+// (yazma başarılı olsa bile) sohbet ekranının donmasına/yavaşlamasına yol açıyordu.
+// Bu fonksiyon her fotoğrafı gönderilmeden önce otomatik olarak küçültüp sıkıştırır,
+// böylece kullanıcı manuel bir şey yapmadan normal telefon fotoğrafları da çalışır.
+function compressImage(file, maxDim, quality){
+  return new Promise((resolve, reject)=>{
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = ()=>{
+      let { width, height } = img;
+      if(width > maxDim || height > maxDim){
+        if(width >= height){ height = Math.round(height * (maxDim / width)); width = maxDim; }
+        else { width = Math.round(width * (maxDim / height)); height = maxDim; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width; canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = ()=>{ URL.revokeObjectURL(url); reject(new Error('Görsel okunamadı')); };
+    img.src = url;
+  });
+}
+
+// Bir görseli, verilen bayt sınırının altına inene kadar giderek daha düşük
+// kalite/boyutla sıkıştırmayı dener. HEIC/JPEG farketmeksizin çalışır çünkü
+// tarayıcı <img> ile açabildiği her formatı canvas'a çizip JPEG'e çeviriyoruz.
+async function compressImageUnder(file, maxBytes, startDim, startQuality){
+  let dim = startDim, quality = startQuality;
+  for(let i=0; i<5; i++){
+    const dataUrl = await compressImage(file, dim, quality);
+    // base64 -> yaklaşık gerçek bayt boyutu
+    const approxBytes = dataUrl.length * 0.75;
+    if(approxBytes <= maxBytes || (dim <= 320 && quality <= 0.4)) return dataUrl;
+    quality = Math.max(0.4, quality - 0.15);
+    dim = Math.max(320, Math.round(dim * 0.85));
+  }
+  return compressImage(file, 320, 0.4);
+}
+
 /* ===================== CHAT VIEW (gerçek zamanlı, titremesiz) ===================== */
 function stopPolling(){
   if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
@@ -1667,6 +1748,10 @@ let currentChatMeta = { type:null, id:null, otherUsers:{} };
 async function renderChat(app){
   const users = await getUsers();
   const other = users[state.chatWith];
+  // Bu sohbeti daha önce hiç mesaj gönderilmeden açtıysak bile (ör. eski/mevcut bir
+  // sohbet) sohbet listesi indeksine eklensin -> bir dahaki listeleme tam koleksiyon
+  // taraması yapmadan bu sohbeti de bulabilsin.
+  addChatPartners(state.currentUser, state.chatWith);
   app.innerHTML = `
     <div class="topbar">
       <div class="back" id="chat-back">${ICONS.chevronLeft}</div>
@@ -1722,7 +1807,10 @@ async function renderChat(app){
   const subInt = setInterval(async ()=>{
     const sub = document.getElementById('chat-header-sub');
     if(!sub || state.screen !== 'chat'){ clearInterval(subInt); return; }
-    const u = await getUsers();
+    // Sadece karşı tarafın kendi dokümanını çek; tüm kullanıcı koleksiyonunu
+    // yeniden indirmeye gerek yok.
+    const doc = await db.collection('users').doc(state.chatWith).get();
+    const u = { [state.chatWith]: doc.exists ? doc.data() : null };
     sub.innerHTML = onlineStatusText(state.chatWith, u);
   }, 15000);
 }
@@ -1920,24 +2008,60 @@ async function sendTextMessage(){
   inp.value = '';
   const msg = { id: genId(), from: state.currentUser, type:'text', content:text, time: Date.now(), read:false };
   appendOptimistic(msg);
-  if(currentChatMeta.type === 'group') await pushGroupMessage(currentChatMeta.id, msg);
-  else await pushMessage(state.currentUser, state.chatWith, msg);
+  let ok;
+  if(currentChatMeta.type === 'group') ok = await pushGroupMessage(currentChatMeta.id, msg);
+  else { const res = await pushMessage(state.currentUser, state.chatWith, msg); ok = res.ok; }
+  if(!ok){
+    removeOptimistic(msg.id);
+    toast('Mesaj gönderilemedi. Lütfen tekrar dene.');
+  }
+}
+
+// Optimistik olarak eklenen ama sunucuya yazılamayan bir mesajı ekrandan kaldırır.
+function removeOptimistic(msgId){
+  currentMsgsCache = currentMsgsCache.filter(m=> m.id !== msgId);
+  const box = document.getElementById('messages');
+  const el = box && box.querySelector(`.bubble[data-id="${msgId}"]`);
+  if(el) el.remove();
+  if(currentMsgsCache.length === 0 && box) box.innerHTML = `<div class="empty-hint">Henüz mesaj yok. İlk mesajı gönder</div>`;
 }
 
 async function sendMediaMessage(e, type){
   const file = e.target.files[0];
   e.target.value = '';
   if(!file) return;
-  const maxSize = type === 'video' ? 4_500_000 : 1_500_000;
-  if(file.size > maxSize){
-    toast(`Dosya çok büyük (max ~${type==='video'?'4.5MB video':'1.5MB fotoğraf'})`);
-    return;
+  let dataUrl;
+  if(type === 'image'){
+    if(!file.type || !file.type.startsWith('image/')){ toast('Lütfen bir fotoğraf seçin'); return; }
+    toast('Fotoğraf hazırlanıyor...');
+    try{
+      // Telefon fotoğrafları otomatik olarak küçültülüp sıkıştırılır; kullanıcının
+      // dosya boyutuyla uğraşmasına gerek kalmaz.
+      dataUrl = await compressImageUnder(file, 450_000, 1280, 0.78);
+    }catch(err){
+      console.error(err);
+      toast('Fotoğraf okunamadı, başka bir fotoğraf dene');
+      return;
+    }
+  } else {
+    // Video için istemci tarafında sıkıştırma yapılmıyor; Firestore'un doküman başına
+    // ~1MB sınırı olduğundan (tüm sohbet geçmişiyle birlikte) videolar küçük tutulmalı.
+    const maxSize = 1_200_000;
+    if(file.size > maxSize){
+      toast('Video çok büyük (max ~1.2MB). Daha kısa/düşük çözünürlüklü bir video dene.');
+      return;
+    }
+    dataUrl = await fileToDataURL(file);
   }
-  const dataUrl = await fileToDataURL(file);
   const msg = { id: genId(), from: state.currentUser, type, content:dataUrl, time: Date.now(), read:false };
   appendOptimistic(msg);
-  if(currentChatMeta.type === 'group') await pushGroupMessage(currentChatMeta.id, msg);
-  else await pushMessage(state.currentUser, state.chatWith, msg);
+  let ok;
+  if(currentChatMeta.type === 'group') ok = await pushGroupMessage(currentChatMeta.id, msg);
+  else { const res = await pushMessage(state.currentUser, state.chatWith, msg); ok = res.ok; }
+  if(!ok){
+    removeOptimistic(msg.id);
+    toast('Gönderilemedi (sohbet geçmişi çok büyük olabilir). Lütfen tekrar dene.');
+  }
 }
 
 /* ===================== GRUP PROFİLİ ===================== */
@@ -2010,11 +2134,20 @@ async function showGroupProfileModal(groupId){
     document.getElementById('grp-avatar-pick').onclick = ()=> document.getElementById('grp-photo-file').click();
     document.getElementById('grp-photo-file').onchange = async (e)=>{
       const file = e.target.files[0];
+      e.target.value = '';
       if(!file) return;
-      if(file.size > 1_500_000){ toast('Fotoğraf çok büyük (max ~1.5MB)'); return; }
-      const dataUrl = await fileToDataURL(file);
-      await updateGroup(g.id, { photo: dataUrl });
-      toast('Grup fotoğrafı güncellendi');
+      if(!file.type || !file.type.startsWith('image/')){ toast('Lütfen bir fotoğraf seçin'); return; }
+      toast('Fotoğraf işleniyor...');
+      let dataUrl;
+      try{
+        dataUrl = await compressImageUnder(file, 350_000, 640, 0.82);
+      }catch(err){
+        console.error(err);
+        toast('Fotoğraf okunamadı, başka bir fotoğraf dene');
+        return;
+      }
+      const ok = await updateGroup(g.id, { photo: dataUrl });
+      toast(ok ? 'Grup fotoğrafı güncellendi' : 'Fotoğraf kaydedilemedi, tekrar dene');
       overlay.remove();
       showGroupProfileModal(groupId);
     };
@@ -2432,22 +2565,40 @@ function fmtCallDuration(ms){
 }
 async function flipCamera(){
   if(!state.call || !localStream) return;
-  const videoTrack = localStream.getVideoTracks()[0];
-  if(!videoTrack) return;
-  const currentFacing = videoTrack.getSettings().facingMode;
-  const newFacing = currentFacing === 'user' ? 'environment' : 'user';
+  const oldTrack = localStream.getVideoTracks()[0];
+  if(!oldTrack) return;
+  const currentFacing = oldTrack.getSettings().facingMode || state.call.facing || 'user';
+  const newFacing = currentFacing === 'environment' ? 'user' : 'environment';
+  // Çoğu telefon ön ve arka kamerayı aynı anda açamaz; bu yüzden yeni kamerayı
+  // istemeden önce mevcut kamerayı kapatmamız gerekiyor. Eskiden yeni kamera
+  // istenmeden eskisi durdurulmuyordu, bu da "kamera meşgul" hatasıyla
+  // değiştirme işleminin sessizce başarısız olmasına yol açıyordu.
+  oldTrack.stop();
+  localStream.removeTrack(oldTrack);
   try{
-    const newStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:newFacing }, audio:false });
+    const newStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:newFacing } }, audio:false });
     const newTrack = newStream.getVideoTracks()[0];
+    localStream.addTrack(newTrack);
     const sender = pc && pc.getSenders().find(s=> s.track && s.track.kind === 'video');
     if(sender) await sender.replaceTrack(newTrack);
-    videoTrack.stop();
-    localStream.removeTrack(videoTrack);
-    localStream.addTrack(newTrack);
+    state.call.facing = newFacing;
     const lv = document.getElementById('local-video');
     if(lv) lv.srcObject = localStream;
     toast('Kamera çevrildi');
-  }catch(e){ console.error(e); toast('Kamera çevrilemedi'); }
+  }catch(e){
+    console.error(e);
+    toast('Kamera çevrilemedi, cihazında ikinci bir kamera olmayabilir');
+    // Görüntü tamamen kaybolmasın diye eski kamerayı geri açmayı dene.
+    try{
+      const restoreStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:currentFacing } }, audio:false });
+      const restoreTrack = restoreStream.getVideoTracks()[0];
+      localStream.addTrack(restoreTrack);
+      const sender = pc && pc.getSenders().find(s=> s.track && s.track.kind === 'video');
+      if(sender) await sender.replaceTrack(restoreTrack);
+      const lv = document.getElementById('local-video');
+      if(lv) lv.srcObject = localStream;
+    }catch(e2){ console.error(e2); }
+  }
 }
 async function openSpeakerPicker(){
   try{
@@ -2587,7 +2738,7 @@ async function renderCallOverlay(){
             <div class="call-status" id="call-timer">00:00</div>
           </div>
         `}
-        <div style="display:flex;justify-content:center;padding-bottom:calc(28px + env(safe-area-inset-bottom,0px));position:relative;z-index:3;">
+        <div style="position:absolute;left:0;right:0;bottom:0;display:flex;justify-content:center;padding-bottom:calc(28px + env(safe-area-inset-bottom,0px));z-index:3;">
           <div class="call-pill">
             ${isVideo ? `<button class="pill-btn" id="call-flip" title="Kamerayı çevir">${ICONS.flipCam}</button>` : ``}
             ${isVideo ? `<button class="pill-btn ${c.camOn?`active`:``}" id="call-cam" title="Kamera">${c.camOn ? ICONS.camOn : ICONS.camOff}</button>` : ``}
