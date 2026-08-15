@@ -17,6 +17,7 @@
 <!-- Firebase (gerçek, paylaşılan, kalıcı veritabanı için) -->
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
 <style>
   :root{
     --bg:#ffffff;
@@ -562,6 +563,36 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
+const auth = firebase.auth();
+
+/* ===================== FIREBASE AUTH HELPERS =====================
+   Kullanıcı adı tabanlı sistemi koruyabilmek için Firebase Authentication'a
+   sahte bir e-posta adresiyle kayıt oluyoruz (ör. "ahmet" -> "ahmet@jestchat.local").
+   Gerçek şifre hiçbir zaman Firestore'a yazılmıyor; şifre karşılaştırmasını
+   Firebase'in kendi güvenli Authentication sistemi yapıyor.
+============================================================ */
+function usernameToEmail(username){
+  return username.toLowerCase() + '@jestchat.local';
+}
+function friendlyAuthError(code){
+  switch(code){
+    case 'auth/email-already-in-use': return 'Bu kullanıcı adı zaten alınmış.';
+    case 'auth/weak-password': return 'Parola en az 6 karakter olmalı.';
+    case 'auth/wrong-password':
+    case 'auth/user-not-found':
+    case 'auth/invalid-credential': return 'Kullanıcı adı veya parola hatalı.';
+    case 'auth/too-many-requests': return 'Çok fazla deneme yapıldı, biraz sonra tekrar dene.';
+    default: return 'Bir hata oluştu: ' + code;
+  }
+}
+async function isCurrentUserAdmin(){
+  const u = auth.currentUser;
+  if(!u) return false;
+  try{
+    const doc = await db.collection('admins').doc(u.uid).get();
+    return doc.exists;
+  }catch(e){ console.error(e); return false; }
+}
 
 /* ===================== STORAGE HELPERS ===================== */
 async function getUsers(){
@@ -586,18 +617,8 @@ async function saveUsers(u){
 async function deleteUser(name){
   try{ await db.collection('users').doc(name).delete(); }catch(e){ console.error(e); }
 }
-async function getAdminCreds(){
-  try{
-    const doc = await db.collection('settings').doc('admin_creds').get();
-    if(doc.exists) return doc.data();
-  }catch(e){ console.error(e); }
-  const def = {username:'admin', password:'admin123'};
-  try{ await db.collection('settings').doc('admin_creds').set(def); }catch(e){}
-  return def;
-}
-async function saveAdminCreds(creds){
-  try{ await db.collection('settings').doc('admin_creds').set(creds); }catch(e){ console.error(e); }
-}
+/* NOT: Eski admin_creds sistemi kaldırıldı. Admin yetkisi artık Firestore'daki
+   "admins/{uid}" koleksiyonuyla kontrol ediliyor (bkz. isCurrentUserAdmin()). */
 // Tek bir kullanıcının belgesindeki bazı alanları, tüm kullanıcı listesini
 // yeniden yazmadan (daha hızlı ve çakışmasız) güncellemek için.
 async function updateUserField(username, fields){
@@ -1058,23 +1079,39 @@ async function handleAuthSubmit(){
   const uname = document.getElementById('in-username').value.trim();
   const pass = document.getElementById('in-password').value;
   const errEl = document.getElementById('auth-error');
+  const submitBtn = document.getElementById('auth-submit');
   errEl.textContent = '';
   if(!uname || !pass){ errEl.textContent = 'Kullanıcı adı ve parola gerekli.'; return; }
   if(!/^[a-zA-Z0-9_.]{3,20}$/.test(uname)){ errEl.textContent = 'Kullanıcı adı 3-20 karakter, harf/rakam/_ olmalı.'; return; }
 
-  const users = await getUsers();
-  if(state.authMode === 'register'){
-    if(users[uname]){ errEl.textContent = 'Bu kullanıcı adı zaten alınmış.'; return; }
-    if(pass.length < 4){ errEl.textContent = 'Parola en az 4 karakter olmalı.'; return; }
-    users[uname] = { password: pass, bio: '', avatar: '', status: '', statusTime: 0, createdAt: Date.now() };
-    await saveUsers(users);
-    toast('Hesap oluşturuldu!');
-    state.currentUser = uname;
-  } else {
-    const u = users[uname];
-    if(!u || u.password !== pass){ errEl.textContent = 'Kullanıcı adı veya parola hatalı.'; return; }
-    state.currentUser = uname;
+  submitBtn.disabled = true;
+  const email = usernameToEmail(uname);
+  try{
+    if(state.authMode === 'register'){
+      if(pass.length < 6){ errEl.textContent = 'Parola en az 6 karakter olmalı.'; submitBtn.disabled=false; return; }
+      const cred = await auth.createUserWithEmailAndPassword(email, pass);
+      const users = await getUsers();
+      users[uname] = { uid: cred.user.uid, bio: '', avatar: '', status: '', statusTime: 0, createdAt: Date.now() };
+      await saveUsers(users);
+      toast('Hesap oluşturuldu!');
+      state.currentUser = uname;
+    } else {
+      const cred = await auth.signInWithEmailAndPassword(email, pass);
+      const users = await getUsers();
+      // Eski kayıtlardan gelen ve henüz Auth'a taşınmamış kullanıcı belgesi varsa uid'i tamamla
+      if(users[uname] && !users[uname].uid){
+        users[uname].uid = cred.user.uid;
+        await saveUsers(users);
+      }
+      state.currentUser = uname;
+    }
+  }catch(e){
+    console.error(e);
+    errEl.textContent = friendlyAuthError(e.code);
+    submitBtn.disabled = false;
+    return;
   }
+  submitBtn.disabled = false;
   saveSession(state.currentUser);
   startIncomingCallListener();
   startHeartbeat();
@@ -1583,6 +1620,7 @@ function renderSettingsTab(content, users){
     stopIncomingCallListener();
     cleanupCall();
     clearSession();
+    auth.signOut().catch(e=>console.error(e));
     state.currentUser = null;
     state.screen = 'auth';
     render();
@@ -1989,37 +2027,58 @@ async function showGroupProfileModal(groupId){
   }
 }
 
-/* ===================== ADMIN ===================== */
+/* ===================== ADMIN =====================
+   Admin girişi artık normal Firebase Authentication üzerinden yapılıyor.
+   Bir hesabın admin olup olmadığı, Firestore'daki "admins/{uid}" koleksiyonunda
+   o kullanıcının UID'sinin bir doküman olarak var olup olmadığına bakılarak
+   kontrol edilir. Bu koleksiyona yeni admin eklemek İÇİN Firestore Rules'ta
+   client-write kapalı tutulmalı; ekleme Firebase Console'dan elle yapılmalı:
+   1) İlgili kullanıcı normal "Hesap oluştur" ekranından bir hesap açsın.
+   2) Firebase Console > Authentication sekmesinden bu kullanıcının UID'sini kopyala.
+   3) Firestore > "admins" koleksiyonu > Doküman ID'si = o UID, herhangi bir alan
+      ekleyerek (ör. isAdmin:true) dokümanı oluştur.
+============================================================ */
 async function renderAdminLogin(app){
-  const creds0 = await getAdminCreds();
   app.innerHTML = `
     <div class="center-screen">
       ${brandMark(`<span class="admin-badge">ADMIN</span>`)}
       <div class="tagline">Yönetici girişi</div>
       <div class="field">
         <label>Yönetici kullanıcı adı</label>
-        <input type="text" id="admin-username" value="${creds0.username}">
+        <input type="text" id="admin-username" autocomplete="username">
       </div>
       <div class="field">
         <label>Yönetici parolası</label>
-        <input type="password" id="admin-password" placeholder="Parolayı gir">
+        <input type="password" id="admin-password" placeholder="Parolayı gir" autocomplete="current-password">
       </div>
       <div class="error-msg" id="admin-error"></div>
       <button class="btn danger" id="admin-submit">Yönetici olarak gir</button>
       <button class="link-btn" id="admin-cancel">İptal / normal ekrana dön</button>
     </div>
   `;
-  document.getElementById('admin-password').focus();
+  document.getElementById('admin-username').focus();
   const doSubmit = async ()=>{
     const u = document.getElementById('admin-username').value.trim();
     const p = document.getElementById('admin-password').value;
-    const creds = await getAdminCreds();
     const err = document.getElementById('admin-error');
-    if(u === creds.username && p === creds.password){
+    const btn = document.getElementById('admin-submit');
+    err.textContent = '';
+    if(!u || !p){ err.textContent = 'Kullanıcı adı ve parola gerekli.'; return; }
+    btn.disabled = true;
+    try{
+      await auth.signInWithEmailAndPassword(usernameToEmail(u), p);
+      const isAdm = await isCurrentUserAdmin();
+      if(!isAdm){
+        err.textContent = 'Bu hesabın yönetici yetkisi yok.';
+        btn.disabled = false;
+        return;
+      }
       state.screen = 'adminPanel';
       render();
-    } else {
-      err.textContent = 'Yönetici bilgileri hatalı.';
+    }catch(e){
+      console.error(e);
+      err.textContent = friendlyAuthError(e.code);
+      btn.disabled = false;
     }
   };
   document.getElementById('admin-submit').onclick = doSubmit;
@@ -2032,7 +2091,6 @@ async function renderAdminLogin(app){
 
 async function renderAdminPanel(app){
   const users = await getUsers();
-  const creds = await getAdminCreds();
   const names = Object.keys(users);
   app.innerHTML = `
     <div class="topbar">
@@ -2045,21 +2103,21 @@ async function renderAdminPanel(app){
     <div class="content" style="padding:14px;">
       <h3 style="margin-top:0;">Kullanıcılar</h3>
       <table class="admin-table">
-        <thead><tr><th>Kullanıcı</th><th>Parola</th><th>Bio</th><th>Mavi Tik</th><th></th></tr></thead>
+        <thead><tr><th>Kullanıcı</th><th>Bio</th><th>Mavi Tik</th><th></th></tr></thead>
         <tbody>
           ${names.map(n=>`<tr>
             <td>${n}${verifiedBadge(n, users)}</td>
-            <td>${users[n].password}</td>
             <td>${(users[n].bio||'').slice(0,20)}</td>
             <td><button class="admin-toggle-tick ${users[n].verified ? '' : 'off'}" data-tick="${n}">${users[n].verified ? 'Bağla' : 'Aç'}</button></td>
             <td><button class="link-btn" data-del="${n}" style="color:var(--danger);">Sil</button></td>
-          </tr>`).join('') || `<tr><td colspan="5">Henüz kullanıcı yok.</td></tr>`}
+          </tr>`).join('') || `<tr><td colspan="4">Henüz kullanıcı yok.</td></tr>`}
         </tbody>
       </table>
-      <h3>Yönetici parolasını değiştir</h3>
-      <div class="field"><label>Yeni yönetici kullanıcı adı</label><input type="text" id="new-admin-user" value="${creds.username}"></div>
-      <div class="field" style="margin-top:8px;"><label>Yeni yönetici parolası</label><input type="password" id="new-admin-pass" placeholder="Yeni parola"></div>
-      <button class="btn" id="save-admin-creds" style="margin-top:10px;">Kaydet</button>
+      <p style="color:var(--text-muted); font-size:13px;">
+        Not: Şifreler artık burada görüntülenmiyor — Firebase Authentication tarafından
+        güvenli şekilde saklanıyor. Yönetici hesabı eklemek/kaldırmak için Firebase Console
+        &gt; Firestore &gt; "admins" koleksiyonünü kullan.
+      </p>
     </div>
   `;
   document.getElementById('admin-exit').onclick = ()=>{
@@ -2071,7 +2129,7 @@ async function renderAdminPanel(app){
       const n = btn.dataset.del;
       if(!confirm(`${n} kullanıcısı silinsin mi?`)) return;
       await deleteUser(n);
-      toast('Kullanıcı silindi');
+      toast('Kullanıcı silindi (not: Authentication hesabı ayrıca Firebase Console\'dan silinmeli)');
       renderAdminPanel(app);
     };
   });
@@ -2086,13 +2144,6 @@ async function renderAdminPanel(app){
       renderAdminPanel(app);
     };
   });
-  document.getElementById('save-admin-creds').onclick = async ()=>{
-    const nu = document.getElementById('new-admin-user').value.trim() || creds.username;
-    const np = document.getElementById('new-admin-pass').value;
-    const updated = { username: nu, password: np ? np : creds.password };
-    await saveAdminCreds(updated);
-    toast('Yönetici bilgileri güncellendi');
-  };
 }
 
 /* ===================== SESLİ / GÖRÜNTÜLÜ ARAMA (WebRTC) =====================
