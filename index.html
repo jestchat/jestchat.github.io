@@ -1109,6 +1109,12 @@ async function handleAuthSubmit(){
     } else {
       const cred = await auth.signInWithEmailAndPassword(email, pass);
       const users = await getUsers();
+      if(users[uname] && users[uname].banned){
+        await auth.signOut();
+        errEl.textContent = 'Bu hesap yönetici tarafından engellenmiş.';
+        submitBtn.disabled = false;
+        return;
+      }
       // Eski kayıtlardan gelen ve henüz Auth'a taşınmamış kullanıcı belgesi varsa uid'i tamamla
       if(users[uname] && !users[uname].uid){
         users[uname].uid = cred.user.uid;
@@ -1358,7 +1364,8 @@ async function renderChatsTab(content, users){
 
 function renderStatusTab(content, users){
   const me = users[state.currentUser] || {};
-  const others = Object.keys(users).filter(n=>n!==state.currentUser && users[n].status);
+  const contactNames = (me.contacts || []).filter(n=> n !== state.currentUser);
+  const others = contactNames.filter(n=> users[n] && users[n].status);
   content.innerHTML = `
     <div class="add-status-box">
       <label style="font-size:12px;color:var(--text-muted);">Durumun</label>
@@ -2102,21 +2109,25 @@ async function renderAdminLogin(app){
 
 async function renderAdminPanel(app){
   const users = await getUsers();
-  const names = Object.keys(users);
+  const activeNames = Object.keys(users).filter(n=>!users[n].banned);
+  const bannedNames = Object.keys(users).filter(n=>users[n].banned);
   app.innerHTML = `
     <div class="topbar">
       <div class="topbar-user">
         <div class="name">Yönetici Paneli <span class="admin-badge">ADMIN</span></div>
-        <div class="sub">${names.length} kayıtlı kullanıcı</div>
+        <div class="sub">${activeNames.length} kayıtlı kullanıcı${bannedNames.length ? ` · ${bannedNames.length} engelli` : ''}</div>
       </div>
       <button class="icon-btn" id="admin-exit" title="Çıkış">${ICONS.close}</button>
     </div>
     <div class="content" style="padding:14px;">
       <h3 style="margin-top:0;">Kullanıcılar</h3>
+      <div class="field" style="margin-bottom:10px;">
+        <input type="text" id="admin-user-search" placeholder="Kullanıcı adı ara...">
+      </div>
       <table class="admin-table">
         <thead><tr><th>Kullanıcı</th><th>Bio</th><th>Mavi Tik</th><th></th></tr></thead>
-        <tbody>
-          ${names.map(n=>`<tr>
+        <tbody id="admin-active-tbody">
+          ${activeNames.map(n=>`<tr data-name="${n.toLowerCase()}">
             <td>${n}${verifiedBadge(n, users)}</td>
             <td>${(users[n].bio||'').slice(0,20)}</td>
             <td><button class="admin-toggle-tick ${users[n].verified ? '' : 'off'}" data-tick="${n}">${users[n].verified ? 'Bağla' : 'Aç'}</button></td>
@@ -2124,10 +2135,29 @@ async function renderAdminPanel(app){
           </tr>`).join('') || `<tr><td colspan="4">Henüz kullanıcı yok.</td></tr>`}
         </tbody>
       </table>
+      <div id="admin-active-noresult" class="hidden" style="color:var(--text-muted); font-size:13px; padding:8px 0;">Eşleşen kullanıcı bulunamadı.</div>
+      ${bannedNames.length ? `
+      <h3>Engellenen Kullanıcılar</h3>
+      <div class="field" style="margin-bottom:10px;">
+        <input type="text" id="admin-banned-search" placeholder="Engelli kullanıcı ara...">
+      </div>
+      <table class="admin-table">
+        <thead><tr><th>Kullanıcı</th><th></th></tr></thead>
+        <tbody id="admin-banned-tbody">
+          ${bannedNames.map(n=>`<tr data-name="${n.toLowerCase()}">
+            <td>${n}</td>
+            <td><button class="link-btn" data-unban="${n}">Yasağı kaldır</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      <div id="admin-banned-noresult" class="hidden" style="color:var(--text-muted); font-size:13px; padding:8px 0;">Eşleşen kullanıcı bulunamadı.</div>
+      ` : ''}
       <p style="color:var(--text-muted); font-size:13px;">
         Not: Şifreler artık burada görüntülenmiyor — Firebase Authentication tarafından
-        güvenli şekilde saklanıyor. Yönetici hesabı eklemek/kaldırmak için Firebase Console
-        &gt; Firestore &gt; "admins" koleksiyonünü kullan.
+        güvenli şekilde saklanıyor. "Sil" bir kullanıcıyı listeden kaldırıp girişini
+        engeller (Authentication hesabı silinmez, dilersen "Yasağı kaldır" ile geri açabilirsin).
+        Yönetici hesabı eklemek/kaldırmak için Firebase Console &gt; Firestore &gt;
+        "admins" koleksiyonünü kullan.
       </p>
     </div>
   `;
@@ -2135,12 +2165,44 @@ async function renderAdminPanel(app){
     state.screen = state.currentUser ? 'main' : 'auth';
     render();
   };
+  function wireSearch(inputId, tbodyId, noResultId){
+    const input = document.getElementById(inputId);
+    if(!input) return;
+    input.addEventListener('input', ()=>{
+      const q = input.value.trim().toLowerCase();
+      const rows = document.querySelectorAll(`#${tbodyId} tr[data-name]`);
+      let visibleCount = 0;
+      rows.forEach(row=>{
+        const match = row.dataset.name.includes(q);
+        row.classList.toggle('hidden', !match);
+        if(match) visibleCount++;
+      });
+      const noResultEl = document.getElementById(noResultId);
+      if(noResultEl) noResultEl.classList.toggle('hidden', visibleCount !== 0 || rows.length === 0);
+    });
+  }
+  wireSearch('admin-user-search', 'admin-active-tbody', 'admin-active-noresult');
+  wireSearch('admin-banned-search', 'admin-banned-tbody', 'admin-banned-noresult');
   app.querySelectorAll('[data-del]').forEach(btn=>{
     btn.onclick = async ()=>{
       const n = btn.dataset.del;
-      if(!confirm(`${n} kullanıcısı silinsin mi?`)) return;
-      await deleteUser(n);
-      toast('Kullanıcı silindi (not: Authentication hesabı ayrıca Firebase Console\'dan silinmeli)');
+      if(!confirm(`${n} kullanıcısı engellensin mi? (Giriş yapamaz hale gelir)`)) return;
+      const usersNow = await getUsers();
+      if(!usersNow[n]) return;
+      usersNow[n].banned = true;
+      await saveUser(n, usersNow[n]);
+      toast('Kullanıcı engellendi');
+      renderAdminPanel(app);
+    };
+  });
+  app.querySelectorAll('[data-unban]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const n = btn.dataset.unban;
+      const usersNow = await getUsers();
+      if(!usersNow[n]) return;
+      usersNow[n].banned = false;
+      await saveUser(n, usersNow[n]);
+      toast('Yasak kaldırıldı');
       renderAdminPanel(app);
     };
   });
@@ -2583,6 +2645,13 @@ async function renderCallOverlay(){
   if(savedUser){
     // Kayıtlı oturum var mı ve kullanıcı hâlâ mevcut mu diye kontrol et
     const users = await getUsers();
+    if(users[savedUser] && users[savedUser].banned){
+      clearSession();
+      auth.signOut().catch(e=>console.error(e));
+      state.screen = 'auth';
+      render();
+      return;
+    }
     if(users[savedUser]){
       state.currentUser = savedUser;
       state.screen = 'main';
