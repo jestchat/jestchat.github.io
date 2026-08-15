@@ -614,6 +614,17 @@ async function saveUsers(u){
     await batch.commit();
   }catch(e){ console.error(e); }
 }
+// Tek bir kullanıcının dokümanını yazar. Güvenlik kuralları her kullanıcının
+// sadece kendi dokümanını (veya admin'in herhangi birini) yazmasına izin verdiği
+// için, tüm kullanıcı map'ini tek seferde yazmaya çalışan saveUsers() burada
+// KULLANILMAMALI — o, ilgisiz kullanıcıların dokümanlarını da batch'e dahil edip
+// izin hatasıyla TÜM işlemi başarısız kılar. Tek kullanıcı güncellemesi için
+// her zaman bunu kullan.
+async function saveUser(username, data){
+  try{
+    await db.collection('users').doc(username).set(data);
+  }catch(e){ console.error(e); }
+}
 async function deleteUser(name){
   try{ await db.collection('users').doc(name).delete(); }catch(e){ console.error(e); }
 }
@@ -1092,7 +1103,7 @@ async function handleAuthSubmit(){
       const cred = await auth.createUserWithEmailAndPassword(email, pass);
       const users = await getUsers();
       users[uname] = { uid: cred.user.uid, bio: '', avatar: '', status: '', statusTime: 0, createdAt: Date.now() };
-      await saveUsers(users);
+      await saveUser(uname, users[uname]);
       toast('Hesap oluşturuldu!');
       state.currentUser = uname;
     } else {
@@ -1101,7 +1112,7 @@ async function handleAuthSubmit(){
       // Eski kayıtlardan gelen ve henüz Auth'a taşınmamış kullanıcı belgesi varsa uid'i tamamla
       if(users[uname] && !users[uname].uid){
         users[uname].uid = cred.user.uid;
-        await saveUsers(users);
+        await saveUser(uname, users[uname]);
       }
       state.currentUser = uname;
     }
@@ -1380,7 +1391,7 @@ function renderStatusTab(content, users){
     const usersNow = await getUsers();
     usersNow[state.currentUser].status = val;
     usersNow[state.currentUser].statusTime = Date.now();
-    await saveUsers(usersNow);
+    await saveUser(state.currentUser, usersNow[state.currentUser]);
     toast('Durum güncellendi');
     render();
   };
@@ -1599,14 +1610,14 @@ function renderSettingsTab(content, users){
     const dataUrl = await fileToDataURL(file);
     const usersNow = await getUsers();
     usersNow[state.currentUser].avatar = dataUrl;
-    await saveUsers(usersNow);
+    await saveUser(state.currentUser, usersNow[state.currentUser]);
     toast('Profil fotoğrafı güncellendi');
     render();
   };
   document.getElementById('save-bio').onclick = async ()=>{
     const usersNow = await getUsers();
     usersNow[state.currentUser].bio = document.getElementById('bio-input').value.trim();
-    await saveUsers(usersNow);
+    await saveUser(state.currentUser, usersNow[state.currentUser]);
     toast('Biyografi kaydedildi');
   };
   document.getElementById('theme-toggle').onchange = async (e)=>{
@@ -2139,7 +2150,7 @@ async function renderAdminPanel(app){
       const usersNow = await getUsers();
       if(!usersNow[n]) return;
       usersNow[n].verified = !usersNow[n].verified;
-      await saveUsers(usersNow);
+      await saveUser(n, usersNow[n]);
       toast(usersNow[n].verified ? `${n} kullanıcısına mavi tik verildi` : `${n} kullanıcısının mavi tiki kaldırıldı`);
       renderAdminPanel(app);
     };
