@@ -98,6 +98,29 @@
   @supports (height: 100dvh){
     #app{min-height:100dvh;}
   }
+  /* ---- Screen & tab transitions ---- */
+  .screen-wrap{
+    display:flex;
+    flex-direction:column;
+    flex:1;
+    min-height:100%;
+    width:100%;
+    transform:translateZ(0);
+  }
+  .screen-wrap.dir-forward{ animation:jcSlideInRight .24s cubic-bezier(.25,.7,.4,1) both; }
+  .screen-wrap.dir-back{ animation:jcSlideInLeft .24s cubic-bezier(.25,.7,.4,1) both; }
+  .screen-wrap.dir-fade{ animation:jcFadeIn .16s ease both; }
+  .screen-wrap.dir-tabright{ animation:jcTabInRight .18s ease both; }
+  .screen-wrap.dir-tableft{ animation:jcTabInLeft .18s ease both; }
+  .screen-wrap.dir-none{ animation:none; }
+  @keyframes jcSlideInRight{ from{ transform:translate3d(7%,0,0); opacity:0; } to{ transform:translate3d(0,0,0); opacity:1; } }
+  @keyframes jcSlideInLeft{ from{ transform:translate3d(-7%,0,0); opacity:0; } to{ transform:translate3d(0,0,0); opacity:1; } }
+  @keyframes jcFadeIn{ from{ opacity:0; transform:translate3d(0,3px,0);} to{ opacity:1; transform:translate3d(0,0,0);} }
+  @keyframes jcTabInRight{ from{opacity:0; transform:translate3d(12px,0,0);} to{opacity:1; transform:translate3d(0,0,0);} }
+  @keyframes jcTabInLeft{ from{opacity:0; transform:translate3d(-12px,0,0);} to{opacity:1; transform:translate3d(0,0,0);} }
+  @media (prefers-reduced-motion: reduce){
+    .screen-wrap.dir-forward, .screen-wrap.dir-back, .screen-wrap.dir-fade, .screen-wrap.dir-tabright, .screen-wrap.dir-tableft{ animation:none; }
+  }
   @media (min-width:620px){
     body{
       padding:26px 0;
@@ -433,7 +456,7 @@
   .tabbar button .icon svg{width:21px;height:21px;display:block;margin:0 auto;}
   .tick-icon{display:inline-flex;vertical-align:-2px;margin-right:2px;}
   .tick-icon svg, .tick-icon img{width:13px;height:13px;display:block;}
-  .verified-badge{margin-left:4px;margin-right:0;vertical-align:-3px;display:inline-flex;}
+  .verified-badge{margin-left:2px;margin-right:0;vertical-align:-3px;display:inline-flex;}
   .verified-badge svg, .verified-badge img{width:16px;height:16px;}
   .badge-img{width:100%;height:100%;object-fit:contain;}
   .admin-toggle-tick{
@@ -602,14 +625,35 @@ async function isCurrentUserAdmin(){
 }
 
 /* ===================== STORAGE HELPERS ===================== */
-async function getUsers(){
+// Kısa ömürlü bellek içi önbellek: her ekran geçişinde/tab değişiminde
+// tüm "users" koleksiyonunu yeniden ağdan çekmek, geçiş animasyonlarını
+// beklemeye zorlayıp kasma/donma hissi yaratıyordu. Önbellek varsa anında
+// döner; arka planda tazeler. force=true ile (mesaj gönderme, profil
+// kaydetme gibi kritik anlarda) her zaman taze veri istenebilir.
+let usersCache = null;
+let usersCacheTime = 0;
+const USERS_CACHE_TTL = 4000;
+async function getUsers(force){
+  const fresh = usersCache && (Date.now() - usersCacheTime) < USERS_CACHE_TTL;
+  if(fresh && !force) return usersCache;
+  if(usersCache && !force){
+    // Önbellek biraz eski ama elimizde var: onu hemen döndür, arka planda tazele.
+    refreshUsersCache();
+    return usersCache;
+  }
+  return await refreshUsersCache();
+}
+async function refreshUsersCache(){
   try{
     const snap = await db.collection('users').get();
     const users = {};
     snap.forEach(doc => { users[doc.id] = doc.data(); });
+    usersCache = users;
+    usersCacheTime = Date.now();
     return users;
-  }catch(e){ console.error(e); return {}; }
+  }catch(e){ console.error(e); return usersCache || {}; }
 }
+function invalidateUsersCache(){ usersCacheTime = 0; }
 async function saveUsers(u){
   // 'u' bütün kullanıcı map'i olabilir (register/profil güncellemelerinde her zaman böyle kullanılıyor).
   // Her kullanıcıyı kendi dokümanına yazıyoruz ki eş zamanlı kayıtlar birbirini ezmesin.
@@ -630,11 +674,12 @@ async function saveUsers(u){
 async function saveUser(username, data){
   try{
     await db.collection('users').doc(username).set(data);
+    invalidateUsersCache();
     return true;
   }catch(e){ console.error(e); return false; }
 }
 async function deleteUser(name){
-  try{ await db.collection('users').doc(name).delete(); }catch(e){ console.error(e); }
+  try{ await db.collection('users').doc(name).delete(); invalidateUsersCache(); }catch(e){ console.error(e); }
 }
 /* NOT: Eski admin_creds sistemi kaldırıldı. Admin yetkisi artık Firestore'daki
    "admins/{uid}" koleksiyonuyla kontrol ediliyor (bkz. isCurrentUserAdmin()). */
@@ -645,6 +690,7 @@ async function updateUserField(username, fields){
   catch(e){
     try{ await db.collection('users').doc(username).set(fields, {merge:true}); }catch(e2){ console.error(e2); }
   }
+  invalidateUsersCache();
 }
 // Admin tarafından silinmiş / artık var olmayan bir kullanıcı için görünen ad.
 function displayName(username, users){
@@ -668,11 +714,13 @@ async function addContact(me, other){
   }catch(e){
     try{ await db.collection('users').doc(me).set({ contacts:[other] }, {merge:true}); }catch(e2){ console.error(e2); }
   }
+  invalidateUsersCache();
 }
 async function removeContact(me, other){
   try{
     await db.collection('users').doc(me).update({ contacts: firebase.firestore.FieldValue.arrayRemove(other) });
   }catch(e){ console.error(e); }
+  invalidateUsersCache();
 }
 /* ---- Gruplar ---- */
 async function createGroup({name, photo, description, admin, members}){
@@ -837,27 +885,29 @@ async function getRecentChats(username){
     });
     const groups = await getGroupsFor(username);
     const memberIds = new Set(groups.map(g=>g.id));
-    for(const g of groups){
+    // Grup mesajlarını sırayla değil paralel çekiyoruz: çok grup olduğunda
+    // sohbetler sekmesinin açılışını yavaşlatan asıl darboğaz buydu.
+    await Promise.all(groups.map(async g=>{
       const msgs = await getGroupMessages(g.id);
       const visible = msgs.filter(m=> !(m.deletedFor && m.deletedFor.includes(username)));
-      if(visible.length === 0) continue;
+      if(visible.length === 0) return;
       const last = visible[visible.length-1];
       const unread = visible.some(m => m.from !== username && !(m.readBy||[]).includes(username));
       chats.push({ other: g.name, group: g, last, unread, type:'group' });
-    }
+    }));
     const leftGroups = (meDocEarly.exists && meDocEarly.data().leftGroups) || [];
     const leftAtMap = (meDocEarly.exists && meDocEarly.data().leftAt) || {};
-    for(const gid of leftGroups){
-      if(memberIds.has(gid)) continue;
+    await Promise.all(leftGroups.map(async gid=>{
+      if(memberIds.has(gid)) return;
       const g = await getGroup(gid);
-      if(!g) continue;
+      if(!g) return;
       const msgs = await getGroupMessages(g.id);
       const leftAt = leftAtMap[gid] || 0;
       const visible = msgs.filter(m=> !(m.deletedFor && m.deletedFor.includes(username)) && (!leftAt || m.time <= leftAt));
-      if(visible.length === 0) continue;
+      if(visible.length === 0) return;
       const last = visible[visible.length-1];
       chats.push({ other: g.name, group: g, last, unread:false, type:'group', left:true });
-    }
+    }));
     chats.sort((a,b) => b.last.time - a.last.time);
     return chats;
   }catch(e){ console.error(e); return []; }
@@ -889,6 +939,7 @@ const state = {
   authMode: 'login',      // login | register
   currentUser: null,
   activeTab: 'chats',      // chats | status | contacts | settings
+  navDirection: null,      // geçiş animasyonu yönü: forward | back | fade | tabright | tableft | none
   chatWith: null,
   activeGroupId: null,
   theme: 'light',
@@ -1069,14 +1120,25 @@ window.addEventListener('keydown', (e)=>{
 async function render(){
   applyTheme();
   const app = document.getElementById('app');
+  const dir = state.navDirection || 'fade';
+  state.navDirection = null;
   app.innerHTML = '';
-  if(state.screen === 'loading') return renderLoading(app);
-  if(state.screen === 'auth') return renderAuth(app);
-  if(state.screen === 'main') return renderMain(app);
-  if(state.screen === 'chat') return renderChat(app);
-  if(state.screen === 'groupChat') return renderGroupChat(app);
-  if(state.screen === 'adminLogin') return renderAdminLogin(app);
-  if(state.screen === 'adminPanel') return renderAdminPanel(app);
+  const wrap = document.createElement('div');
+  wrap.className = 'screen-wrap dir-' + dir;
+  app.appendChild(wrap);
+  if(dir !== 'none'){
+    // Animasyon bittiğinde will-change/transform katmanını bırak: hafızayı ve
+    // performansı korur, aksi halde arka arkaya geçişlerde kasma birikebilir.
+    wrap.addEventListener('animationend', ()=>{ wrap.style.willChange = 'auto'; }, { once:true });
+    wrap.style.willChange = 'transform, opacity';
+  }
+  if(state.screen === 'loading') return renderLoading(wrap);
+  if(state.screen === 'auth') return renderAuth(wrap);
+  if(state.screen === 'main') return renderMain(wrap);
+  if(state.screen === 'chat') return renderChat(wrap);
+  if(state.screen === 'groupChat') return renderGroupChat(wrap);
+  if(state.screen === 'adminLogin') return renderAdminLogin(wrap);
+  if(state.screen === 'adminPanel') return renderAdminPanel(wrap);
 }
 
 function renderLoading(app){
@@ -1184,10 +1246,20 @@ async function renderMain(app){
       <button data-tab="settings" class="${state.activeTab==='settings'?'active':''}"><span class="icon">${ICONS.settings}</span>Ayarlar</button>
     </div>
   `;
+  const tabOrder = ['chats','status','contacts','settings'];
   app.querySelectorAll('.tabbar button').forEach(b=>{
-    b.onclick = ()=>{ state.activeTab = b.dataset.tab; render(); };
+    b.onclick = ()=>{
+      if(b.dataset.tab === state.activeTab) return;
+      state.navDirection = tabOrder.indexOf(b.dataset.tab) > tabOrder.indexOf(state.activeTab) ? 'tabright' : 'tableft';
+      state.activeTab = b.dataset.tab;
+      render();
+    };
   });
-  document.getElementById('open-settings').onclick = ()=>{ state.activeTab = 'settings'; render(); };
+  document.getElementById('open-settings').onclick = ()=>{
+    state.navDirection = state.activeTab === 'settings' ? 'none' : 'tabright';
+    state.activeTab = 'settings';
+    render();
+  };
   document.getElementById('my-avatar').onclick = ()=> showProfileModal(state.currentUser, users);
   const content = document.getElementById('main-content');
   if(state.activeTab === 'chats') await renderChatsTab(content, users);
@@ -1319,6 +1391,7 @@ async function renderChatsTab(content, users){
         if(key.startsWith('g:')){ state.activeGroupId = key.slice(2); state.screen='groupChat'; }
         else { state.chatWith = key.slice(2); state.screen='chat'; }
         state.pendingScrollMsgId = msgId;
+        state.navDirection = 'forward';
         render();
       };
     });
@@ -1334,6 +1407,7 @@ async function renderChatsTab(content, users){
           state.chatWith = row.dataset.user;
           state.screen = 'chat';
         }
+        state.navDirection = 'forward';
         render();
       };
       if(isRecent){
@@ -1468,7 +1542,7 @@ async function renderContactsTab(content, users){
       </div>`;
     }).join('');
     list.querySelectorAll('.user-row').forEach(row=>{
-      row.onclick = ()=>{ state.chatWith = row.dataset.user; state.screen='chat'; render(); };
+      row.onclick = ()=>{ state.chatWith = row.dataset.user; state.screen='chat'; state.navDirection='forward'; render(); };
       const av = row.querySelector('.avatar');
       if(av) av.onclick = (e)=>{ e.stopPropagation(); showProfileModal(row.dataset.user, users); };
       attachLongPress(row, ()=>{
@@ -1784,6 +1858,7 @@ async function renderChat(app){
     stopPolling();
     state.screen = 'main';
     state.activeTab = 'chats';
+    state.navDirection = 'back';
     render();
   };
   const openProfile = ()=> showProfileModal(state.chatWith, users);
@@ -1826,7 +1901,7 @@ async function renderChat(app){
 async function renderGroupChat(app){
   const users = await getUsers();
   const g = await getGroup(state.activeGroupId);
-  if(!g){ toast('Grup bulunamadı'); state.screen='main'; state.activeTab='chats'; render(); return; }
+  if(!g){ toast('Grup bulunamadı'); state.screen='main'; state.activeTab='chats'; state.navDirection='back'; render(); return; }
   app.innerHTML = `
     <div class="topbar">
       <div class="back" id="chat-back">${ICONS.chevronLeft}</div>
@@ -1850,6 +1925,7 @@ async function renderGroupChat(app){
     stopPolling();
     state.screen = 'main';
     state.activeTab = 'chats';
+    state.navDirection = 'back';
     render();
   };
   const openProfile = ()=> showGroupProfileModal(g.id);
@@ -2134,6 +2210,7 @@ async function showGroupProfileModal(groupId){
     await leaveGroup(g.id, state.currentUser);
     overlay.remove();
     state.screen = 'main'; state.activeTab = 'chats';
+    state.navDirection = 'back';
     render();
   };
 
